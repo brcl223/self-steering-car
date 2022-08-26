@@ -2,14 +2,15 @@ import pyrealsense2.pyrealsense2 as rs
 import numpy as np
 import serial # For communicating with Arduino
 from time import sleep
-#import scipy.signal as sig
+import math
+import matplotlib.pyplot as plt
 
 #####################################################
 # Process Params (i.e. Global Vars)
 #####################################################
 
 # CHANGE RUN_NUM BEFORE EACH RUN!
-RUN_NUM = 10
+RUN_NUM = 12
 # Epsilon value for determining if we are within range
 # of our turning target (absolute measure)
 # TODO: Tune me
@@ -22,6 +23,56 @@ TURNING_EPS = 10
 #####################################################
 # Code Begins Here
 #####################################################
+def wrap2pi(x):
+    while x < -math.pi:
+        x += 2 * math.pi
+    while x > math.pi:
+        x -= 2 * math.pi
+    return x
+
+
+class DTMap:
+    def __init__(self):
+        self.data = {}
+
+    def add_data(self, data):
+        data = np.array(data)
+        dlen = data.shape[0]
+        num_ext, peaks, valleys = detect_num_extremums(data)
+        assert num_ext == 4, "Not enough extremums"
+        theta_pi_min = abs(valleys[0] - valleys[1])
+        theta_pi_max = abs(peaks[0] - peaks[1])
+        print(f"Theta pi min: {theta_pi_min}\nTheta pi max: {theta_pi_max}")
+        #assert abs(theta_pi_min - theta_pi_max) < 3, "Data resolution is not fine enough"
+        # Average it. Probably need to do better than this though
+        theta_pi = 0.5 * (theta_pi_min + theta_pi_max)
+
+        theta_vals = [wrap2pi((i - peaks[0]) / theta_pi * math.pi) for i in range(dlen)]
+        print("#######################\n\n")
+        v1min = valleys[0]
+        v2min = valleys[1]
+        d = (data[v1min] - data[v2min]) / (data[v1min] + data[v2min])
+        print(f"d: {d}")
+        print("\n\n#######################\n\n")
+        self.data[d] = theta_vals
+
+    def plot_data(self):
+        print(self.data.items())
+        fig, ax = plt.subplots()
+        for k,v in self.data.items():
+            print(f"Plotting d: {k}")
+            y = [k] * len(v)
+            ax.scatter(v,y)
+
+        # Plot Left / Right line
+        ax.plot([-math.pi, math.pi], [1, -1], linestyle='dashed')
+
+        ax.set(xlabel='Theta', ylabel='d', title='DT Map')
+        plt.tight_layout()
+        fig.savefig(f"./data/dt-map-{RUN_NUM}.png")
+        
+
+
 def check_peak(data, idx):
     score = 0
 
@@ -258,11 +309,12 @@ def turn_to_min_angle(arduino, pipe, data):
     ####################
     # Fine refinement
     ####################
-    EPS_THETA_REFINED = 0.0009 # 0.09% - Very close
+    EPS_THETA_REFINED = 0.002 # 0.2% - Very close
     min_target = depth_est
     num_attempts = 0
     cur_spd = 100
-    while num_attempts < 100 and cur_spd >= 85:
+    while num_attempts < 100:
+        print(f"Cur_dir: {cur_dir}")
         # Find minimum target
         send_cmd(arduino, cur_dir, cur_spd, cur_len)
         depth_est = get_depth_estimate(pipe, nimages=10)
@@ -277,15 +329,19 @@ def turn_to_min_angle(arduino, pipe, data):
             break
         # if depth_est > min_target
         else:
+            min_target = depth_est
             # Switch directions
             cur_dir = "R" if cur_dir == "L" else "L"
             # Reduce speed
-            cur_spd -= 1
+            if cur_spd > 97:
+                cur_spd -= 1
+            if cur_len > 50:
+                cur_len -= 2
 
         num_attempts += 1
 
-    cur_dir = "R" if cur_dir == "L" else "L"
-    send_cmd(arduino, cur_dir, cur_spd, cur_len)
+    #cur_dir = "R" if cur_dir == "L" else "L"
+    #send_cmd(arduino, cur_dir, cur_spd, cur_len)
     print_header("Fine refinement finished!")
     
 
@@ -335,7 +391,71 @@ def reverse_until_centered(arduino, pipe, data):
         print(f"Current Depth: {cur_depth}")
         print(f"Difference: {abs(d_target - cur_depth)}")
         turn_ctr += 1
-        if turn_ctr > 50:
+        #if turn_ctr > 50:
+        if turn_ctr > 10:
+            break
+        elif cur_dir == 'B' and d_target - cur_depth < 0:
+            cur_dir = 'F'
+            cur_spd -= 5
+        elif cur_dir == 'F' and d_target - cur_depth > 0:
+            cur_dir = 'B'
+            dur_spd -= 5
+
+
+
+
+#######################################
+# New code for hitting desired depth
+#######################################
+def get_depth_target(data, perc=0.0):
+    assert -0.5 <= perc <= 0.5
+    _b1, _b2, valley_idxs = detect_num_extremums(data)
+    v1 = data[valley_idxs[0]]
+    v2 = data[valley_idxs[1]]
+    dtot = v1 + v2
+    return ((1- perc) / (2)) * dtot
+
+
+def rel_error(d1, d2):
+    return abs(d1-d2) / (d1+d2)
+
+
+def is_at_depth(d, d_target, p_err=0.04):
+    p_d = rel_error(d,d_target)
+   # print(f"Percent distance: {p_d}")
+   # print(f"D1: {d1}, D2: {d2}")
+    return p_d < p_err
+
+
+def in_center_of_hall(data):
+    _1, _2, valley_idxs = detect_num_extremums(data)
+    v1 = data[valley_idxs[0]]
+    v2 = data[valley_idxs[1]]
+    if is_at_depth(v1, v2):
+        return True
+    return False
+
+
+def reverse_to_depth(arduino, pipe, data, depth=0.0):
+    d_target = get_depth_target(data,perc=depth)
+    cur_depth = get_depth_estimate(pipe, nimages=3)
+
+    print("Reversing data:")
+    print(f"Target Depth: {d_target}")
+    print(f"Current Depth: {cur_depth}")
+    turn_ctr = 1
+    #cur_dir = 'B'
+    cur_dir = 'B' if d_target - cur_depth < 0 else 'F'
+    cur_spd = 100
+    while not is_centered(d_target, cur_depth, p_err=0.01):
+        send_cmd(arduino, cur_dir, cur_spd, 75)
+        cur_depth = get_depth_estimate(pipe, nimages=3)
+        print(f"Target Depth: {d_target}")
+        print(f"Current Depth: {cur_depth}")
+        print(f"Difference: {abs(d_target - cur_depth)}")
+        turn_ctr += 1
+        #if turn_ctr > 50:
+        if turn_ctr > 10:
             break
         elif cur_dir == 'B' and d_target - cur_depth < 0:
             cur_dir = 'F'
@@ -362,12 +482,16 @@ def main():
 
     MAX_CALIBRATION_ATTEMPTS = 10
     calibration_attempt = 0
+
+    dtmap = DTMap()
+
     with serial.Serial('/dev/ttyUSB0', 9600, timeout=10) as arduino:
         init_arduino(arduino)
 
         while calibration_attempt < MAX_CALIBRATION_ATTEMPTS:
             print_header("SCANNING SURROUNDINGS")
             data, smooth_data = scan_surroundings(arduino, pipeline)
+            dtmap.add_data(data)
 
             # CHANGE RUN_NUM BEFORE EACH RUN!
             print_header("SAVING DATA")
@@ -392,6 +516,7 @@ def main():
             calibration_attempt += 1
 
 
+    dtmap.plot_data()
     print_header("RUN COMPLETE")
 
 
