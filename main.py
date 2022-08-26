@@ -9,7 +9,7 @@ from time import sleep
 #####################################################
 
 # CHANGE RUN_NUM BEFORE EACH RUN!
-RUN_NUM = 8
+RUN_NUM = 10
 # Epsilon value for determining if we are within range
 # of our turning target (absolute measure)
 # TODO: Tune me
@@ -105,7 +105,7 @@ def scan_surroundings(arduino, pipeline):
     # This shouldn't be here
     #init_arduino(arduino)
 
-    nimages = 15
+    nimages = 3
 
     seg_data_points = []
     lr_data_points = []
@@ -153,7 +153,7 @@ def send_cmd(arduino, motion, speed, duration):
     # TODO: Add timeout here
     while True:
         data = arduino.readline().decode('utf-8')
-        print(f"[DEBUG] Got line from arduino: {data}",end="")
+        #print(f"[DEBUG] Got line from arduino: {data}",end="")
         if "Complete" in data:
             break
         if "ERROR" in data:
@@ -238,29 +238,72 @@ def turn_to_min_angle(arduino, pipe, data):
     print("Initial start:")
     print(f"Target Depth: {target_depth}")
     print(f"Current Depth: {depth_est}")
-
-    while abs(depth_est - target_depth) > TURNING_EPS:
-        send_cmd(arduino, 'L', 100, 75)
-        depth_est = get_depth_estimate(pipe, nimages=10)
+    cur_dir = "R"
+    cur_len = 100
+    ####################
+    # Course refinement
+    ####################
+    EPS_THETA = 0.02 # 2%
+    while rel_error(depth_est, target_depth) > EPS_THETA:
+        send_cmd(arduino, cur_dir, 100, cur_len)
+        depth_est = get_depth_estimate(pipe, nimages=3)
         print(f"Target Depth: {target_depth}")
         print(f"Current Depth: {depth_est}")
-        print(f"Difference: {abs(depth_est - target_depth)}")
+        print(f"Rel Err: {100 * rel_error(depth_est, target_depth):.2f}% > {100* EPS_THETA}%")
         tries += 1
         if tries > 200:
             raise Exception("Could not get back to min!")
 
+    print_header("Found course refinement!\nBeginning Fine Refinement")
+    ####################
+    # Fine refinement
+    ####################
+    EPS_THETA_REFINED = 0.0009 # 0.09% - Very close
+    min_target = depth_est
+    num_attempts = 0
+    cur_spd = 100
+    while num_attempts < 100 and cur_spd >= 85:
+        # Find minimum target
+        send_cmd(arduino, cur_dir, cur_spd, cur_len)
+        depth_est = get_depth_estimate(pipe, nimages=10)
+        print(f"Current Min Depth: {min_target}")
+        print(f"Current Depth: {depth_est}")
+        print(f"Rel Err: {100 * rel_error(depth_est, min_target):.2f}% > {100* EPS_THETA_REFINED}%")
+        # Keep rotating while we find minimums
+        if depth_est < min_target:
+            min_target = depth_est
+        # This would be a miracle
+        elif depth_est == min_target or rel_error(depth_est, min_target) < EPS_THETA_REFINED:
+            break
+        # if depth_est > min_target
+        else:
+            # Switch directions
+            cur_dir = "R" if cur_dir == "L" else "L"
+            # Reduce speed
+            cur_spd -= 1
+
+        num_attempts += 1
+
+    cur_dir = "R" if cur_dir == "L" else "L"
+    send_cmd(arduino, cur_dir, cur_spd, cur_len)
+    print_header("Fine refinement finished!")
+    
 
 
-def get_depth_target(data):
+def get_depth_target(data, max_weight=0.5, min_weight=0.5):
+    #assert max_weight + min_weight == 1
     _b1, _b2, valley_idxs = detect_num_extremums(data)
     v1 = data[valley_idxs[0]]
     v2 = data[valley_idxs[1]]
-    return 0.5 * (v1 + v2)
+    max_v = max(v1, v2)
+    min_v = min(v1, v2)
+    return max_weight * max_v + min_weight * min_v
 
+def rel_error(d1, d2):
+    return abs(d1-d2) / (d1+d2)
 
-def is_centered(d1, d2):
-    p_err = 0.075 # %
-    p_d = abs(d1 - d2) / (d1 + d2)
+def is_centered(d1, d2, p_err=0.04):
+    p_d = rel_error(d1,d2)
     print(f"Percent distance: {p_d}")
     print(f"D1: {d1}, D2: {d2}")
     return p_d < p_err
@@ -277,21 +320,29 @@ def in_center_of_hall(data):
 
 def reverse_until_centered(arduino, pipe, data):
     d_target = get_depth_target(data)
-    cur_depth = get_depth_estimate(pipe, nimages=15)
+    cur_depth = get_depth_estimate(pipe, nimages=3)
 
     print("Reversing data:")
     print(f"Target Depth: {d_target}")
     print(f"Current Depth: {cur_depth}")
     turn_ctr = 1
-    while not is_centered(d_target, cur_depth):
-        send_cmd(arduino, 'B', 100, 75)
-        cur_depth = get_depth_estimate(pipe, nimages=15)
+    cur_dir = 'B'
+    cur_spd = 100
+    while not is_centered(d_target, cur_depth, p_err=0.01):
+        send_cmd(arduino, cur_dir, cur_spd, 75)
+        cur_depth = get_depth_estimate(pipe, nimages=3)
         print(f"Target Depth: {d_target}")
         print(f"Current Depth: {cur_depth}")
         print(f"Difference: {abs(d_target - cur_depth)}")
         turn_ctr += 1
-        if turn_ctr > 30:
+        if turn_ctr > 50:
             break
+        elif cur_dir == 'B' and d_target - cur_depth < 0:
+            cur_dir = 'F'
+            cur_spd -= 5
+        elif cur_dir == 'F' and d_target - cur_depth > 0:
+            cur_dir = 'B'
+            dur_spd -= 5
 
 
 def print_header(header):
