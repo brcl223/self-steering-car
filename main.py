@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 #####################################################
 
 # CHANGE RUN_NUM BEFORE EACH RUN!
-RUN_NUM = 12
+RUN_NUM = 14
 # Epsilon value for determining if we are within range
 # of our turning target (absolute measure)
 # TODO: Tune me
@@ -34,8 +34,10 @@ def wrap2pi(x):
 class DTMap:
     def __init__(self):
         self.data = {}
+        self.images = {}
 
-    def add_data(self, data):
+    def add_data(self, data, images):
+        assert len(images) == len(data)
         data = np.array(data)
         dlen = data.shape[0]
         num_ext, peaks, valleys = detect_num_extremums(data)
@@ -55,6 +57,7 @@ class DTMap:
         print(f"d: {d}")
         print("\n\n#######################\n\n")
         self.data[d] = theta_vals
+        self.images[d] = images
 
     def plot_data(self):
         print(self.data.items())
@@ -71,8 +74,25 @@ class DTMap:
         plt.tight_layout()
         fig.savefig(f"./data/dt-map-{RUN_NUM}.png")
         
+    def save_images(self):
+        import pathlib
+        DATA_LOC = f"./data/run-{RUN_NUM}-imgs/"
+        pathlib.Path(f"{DATA_LOC}/left").mkdir(parents=True, exist_ok=True)
+        pathlib.Path("{DATA_LOC}/right").mkdir(parents=True, exist_ok=True)
 
+        for d in self.data.keys():
+            imgs = self.images[d]
+            thetas = self.data[d]
+            for i, theta in enumerate(thetas):
+                # if x < -y turn right
+                if (2 / math.pi * theta) < (-d):
+                    fname = f"{DATA_LOC}/right/{d}-{i}.txt"
+                # else turn left
+                else:
+                    fname = f"{DATA_LOC}/left/{d}-{i}.txt"
+                np.savetxt(fname, imgs[i])
 
+        
 def check_peak(data, idx):
     score = 0
 
@@ -160,20 +180,14 @@ def scan_surroundings(arduino, pipeline):
 
     seg_data_points = []
     lr_data_points = []
+    imgs = []
 
     NUM_MOVEMENTS = 75
     for j in range(NUM_MOVEMENTS):
-        #sleep(COMMAND_INTERVAL_SECS)
         print(f"Beginning movement {j+1} of {NUM_MOVEMENTS}...")
-        data_points.append(get_depth_estimate(pipeline, nimages=nimages))
-        #seg_data = get_depth_estimate(pipeline, nregions=3, nimages=nimages)
-        #print(f"\n###################\nl: {l}\nf: {f}\nr: {r}\n###############\n")
-        #lr_data = get_depth_estimate(pipeline, nregions=2, nimages=nimages)
-        #print(f"\n###################\nl2: {l2}\nr2: {r2}\n###############\n")
-        #sleep(COMMAND_INTERVAL_SECS)
-
-        #seg_data_points.append(seg_data)
-        #lr_data_points.append(lr_data)
+        depth_est, image = get_depth_estimate(pipeline, nimages=nimages, return_image=True)
+        data_points.append(depth_est)
+        imgs.append(image)
 
         num_extremums, _b1, _b2 = detect_num_extremums(smooth_data(data_points))
         if num_extremums >= 4:
@@ -184,13 +198,10 @@ def scan_surroundings(arduino, pipeline):
         #turn_for_next_img(arduino)
         send_cmd(arduino, 'L', 125, 75)
 
-    #print("Saving segmented and LR test data...")
     np.savetxt(f"./data/run-{RUN_NUM}.txt", data_points)
     np.savetxt(f"./data/run-{RUN_NUM}-smooth.txt", smooth_data(data_points))
-    #np.savetxt(f"./data/run-{RUN_NUM}-segmented.txt", seg_data_points)
-    #np.savetxt(f"./data/run-{RUN_NUM}-lr.txt", lr_data_points)
-
-    return data_points, smooth_data(data_points)
+    
+    return data_points, smooth_data(data_points), imgs
 
 
 
@@ -228,11 +239,12 @@ def init_arduino(arduino):
 
 # Computes our singular depth value estimate
 # trying to find where the nearest objects are
-def get_depth_estimate(pipe, nimages=60, nregions=1):
+def get_depth_estimate(pipe, nimages=60, nregions=1, return_imgs=False):
     
     IMG_COUNT = nimages # at 30fps this takes ~2 seconds
     MAX_SKIPPED = 10
     skipped_imgs = 0
+    image = None
 
     depth_total = np.zeros(nregions)
 
@@ -255,6 +267,8 @@ def get_depth_estimate(pipe, nimages=60, nregions=1):
             continue
 
         data = np.asanyarray(depth.get_data())
+        if not image:
+            image = np.array(data, copy=True)
         # This is where different depth functions
         # can be tried out. Could be weighted sum
         # or bounding box (or more)
@@ -270,6 +284,10 @@ def get_depth_estimate(pipe, nimages=60, nregions=1):
     # Just return scalar if one region
     if nregions == 1:
         depth_total = depth_total[0]
+
+    if return_images:
+        assert image is not None
+        return depth_total, image
 
     return depth_total
 
@@ -291,12 +309,13 @@ def turn_to_min_angle(arduino, pipe, data):
     print(f"Current Depth: {depth_est}")
     cur_dir = "R"
     cur_len = 100
+    cur_spd = 105
     ####################
     # Course refinement
     ####################
     EPS_THETA = 0.02 # 2%
     while rel_error(depth_est, target_depth) > EPS_THETA:
-        send_cmd(arduino, cur_dir, 100, cur_len)
+        send_cmd(arduino, cur_dir, cur_spd, cur_len)
         depth_est = get_depth_estimate(pipe, nimages=3)
         print(f"Target Depth: {target_depth}")
         print(f"Current Depth: {depth_est}")
@@ -312,7 +331,6 @@ def turn_to_min_angle(arduino, pipe, data):
     EPS_THETA_REFINED = 0.002 # 0.2% - Very close
     min_target = depth_est
     num_attempts = 0
-    cur_spd = 100
     while num_attempts < 100:
         print(f"Cur_dir: {cur_dir}")
         # Find minimum target
@@ -333,80 +351,18 @@ def turn_to_min_angle(arduino, pipe, data):
             # Switch directions
             cur_dir = "R" if cur_dir == "L" else "L"
             # Reduce speed
-            if cur_spd > 97:
+            if cur_spd > 98:
                 cur_spd -= 1
             if cur_len > 50:
-                cur_len -= 2
+                cur_len -= 1
 
         num_attempts += 1
 
     #cur_dir = "R" if cur_dir == "L" else "L"
     #send_cmd(arduino, cur_dir, cur_spd, cur_len)
     print_header("Fine refinement finished!")
-    
 
 
-def get_depth_target(data, max_weight=0.5, min_weight=0.5):
-    #assert max_weight + min_weight == 1
-    _b1, _b2, valley_idxs = detect_num_extremums(data)
-    v1 = data[valley_idxs[0]]
-    v2 = data[valley_idxs[1]]
-    max_v = max(v1, v2)
-    min_v = min(v1, v2)
-    return max_weight * max_v + min_weight * min_v
-
-def rel_error(d1, d2):
-    return abs(d1-d2) / (d1+d2)
-
-def is_centered(d1, d2, p_err=0.04):
-    p_d = rel_error(d1,d2)
-    print(f"Percent distance: {p_d}")
-    print(f"D1: {d1}, D2: {d2}")
-    return p_d < p_err
-
-
-def in_center_of_hall(data):
-    _1, _2, valley_idxs = detect_num_extremums(data)
-    v1 = data[valley_idxs[0]]
-    v2 = data[valley_idxs[1]]
-    if is_centered(v1, v2):
-        return True
-    return False
-
-
-def reverse_until_centered(arduino, pipe, data):
-    d_target = get_depth_target(data)
-    cur_depth = get_depth_estimate(pipe, nimages=3)
-
-    print("Reversing data:")
-    print(f"Target Depth: {d_target}")
-    print(f"Current Depth: {cur_depth}")
-    turn_ctr = 1
-    cur_dir = 'B'
-    cur_spd = 100
-    while not is_centered(d_target, cur_depth, p_err=0.01):
-        send_cmd(arduino, cur_dir, cur_spd, 75)
-        cur_depth = get_depth_estimate(pipe, nimages=3)
-        print(f"Target Depth: {d_target}")
-        print(f"Current Depth: {cur_depth}")
-        print(f"Difference: {abs(d_target - cur_depth)}")
-        turn_ctr += 1
-        #if turn_ctr > 50:
-        if turn_ctr > 10:
-            break
-        elif cur_dir == 'B' and d_target - cur_depth < 0:
-            cur_dir = 'F'
-            cur_spd -= 5
-        elif cur_dir == 'F' and d_target - cur_depth > 0:
-            cur_dir = 'B'
-            dur_spd -= 5
-
-
-
-
-#######################################
-# New code for hitting desired depth
-#######################################
 def get_depth_target(data, perc=0.0):
     assert -0.5 <= perc <= 0.5
     _b1, _b2, valley_idxs = detect_num_extremums(data)
@@ -414,6 +370,13 @@ def get_depth_target(data, perc=0.0):
     v2 = data[valley_idxs[1]]
     dtot = v1 + v2
     return ((1- perc) / (2)) * dtot
+
+
+def get_cur_depth_from_data(data):
+    _b1, _b2, valley_idxs = detect_num_extremums(data)
+    v1 = data[valley_idxs[0]]
+    v2 = data[valley_idxs[1]]
+    return min(v1, v2)
 
 
 def rel_error(d1, d2):
@@ -439,15 +402,15 @@ def in_center_of_hall(data):
 def reverse_to_depth(arduino, pipe, data, depth=0.0):
     d_target = get_depth_target(data,perc=depth)
     cur_depth = get_depth_estimate(pipe, nimages=3)
-
+    TURN_CTR_MAX = 100
     print("Reversing data:")
     print(f"Target Depth: {d_target}")
     print(f"Current Depth: {cur_depth}")
     turn_ctr = 1
     #cur_dir = 'B'
-    cur_dir = 'B' if d_target - cur_depth < 0 else 'F'
+    cur_dir = 'F' if d_target - cur_depth < 0 else 'B'
     cur_spd = 100
-    while not is_centered(d_target, cur_depth, p_err=0.01):
+    while not is_at_depth(cur_depth, d_target, p_err=0.01):
         send_cmd(arduino, cur_dir, cur_spd, 75)
         cur_depth = get_depth_estimate(pipe, nimages=3)
         print(f"Target Depth: {d_target}")
@@ -455,14 +418,14 @@ def reverse_to_depth(arduino, pipe, data, depth=0.0):
         print(f"Difference: {abs(d_target - cur_depth)}")
         turn_ctr += 1
         #if turn_ctr > 50:
-        if turn_ctr > 10:
+        if turn_ctr > TURN_CTR_MAX:
             break
         elif cur_dir == 'B' and d_target - cur_depth < 0:
             cur_dir = 'F'
             cur_spd -= 5
         elif cur_dir == 'F' and d_target - cur_depth > 0:
             cur_dir = 'B'
-            dur_spd -= 5
+            cur_spd -= 5
 
 
 def print_header(header):
@@ -487,11 +450,17 @@ def main():
 
     with serial.Serial('/dev/ttyUSB0', 9600, timeout=10) as arduino:
         init_arduino(arduino)
+        dcur = 0.45
 
         while calibration_attempt < MAX_CALIBRATION_ATTEMPTS:
             print_header("SCANNING SURROUNDINGS")
             data, smooth_data = scan_surroundings(arduino, pipeline)
             dtmap.add_data(data)
+
+            print("\n\n****************************")
+            print(f"After Scanning, current depth: {get_cur_depth_from_data(smooth_data)}")
+            print(f"Aiming for depth target: {get_depth_target(smooth_data, perc=dcur)}")
+            print("*******************************\n\n")
 
             # CHANGE RUN_NUM BEFORE EACH RUN!
             print_header("SAVING DATA")
@@ -511,12 +480,14 @@ def main():
             print_header("TURNING TO DESIRED ANGLE")
             turn_to_min_angle(arduino, pipeline, smooth_data)
 
-            print_header("REVERSING TO TARGET DEPTH")
-            reverse_until_centered(arduino, pipeline, smooth_data)
+            print_header(f"REVERSING TO TARGET DEPTH (d={dcur})")
+            reverse_to_depth(arduino, pipeline, smooth_data, depth=dcur)
             calibration_attempt += 1
+            dcur = max(dcur - 0.15, 0)
 
 
     dtmap.plot_data()
+    dtmap.save_images()
     print_header("RUN COMPLETE")
 
 
