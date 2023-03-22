@@ -1,0 +1,6 @@
+* Useful Links
+- https://medium.com/@gupta.jay/line-follower-robot-algorithm-optimizations-for-better-line-following-64297aeed17e
+  Line following robot write-up. Includes pseudo-code for control implementation.
+- https://colab.research.google.com/github/facebookresearch/habitat-sim/blob/main/examples/tutorials/colabs/ECCV_2020_Navigation.ipynb#scrollTo=dFk9X-tLZG18
+  Tutorial for Habitat AI simulator.
+  Includes tutorials for velocity control and (potentially) top-down plotting of results.

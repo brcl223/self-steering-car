@@ -1,1 +1,9 @@
-data/*
+self-calibration/data/*
+self-calibration/plots/*
+*.mp4
+*.jpg
+*.jpeg
+*.png
+*.npy
+*.DS_Store
+*.zip
